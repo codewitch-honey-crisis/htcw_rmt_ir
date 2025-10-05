@@ -42,6 +42,10 @@ typedef struct {
     rmt_channel_handle_t rx_handle;
     QueueHandle_t rx_queue;
     TaskHandle_t rx_task;
+    volatile bool code_waiting;
+    volatile rmt_ir_vendor_t last_vendor_id;
+    volatile uint32_t last_code;
+    volatile size_t last_size;
     rmt_ir_on_recv_callback_t callback;
     void* callback_state;
 } rmt_ir_recv_dev_t;
@@ -160,7 +164,7 @@ esp_err_t rmt_ir_encoder_reset(rmt_encoder_t *encoder) {
 }
 
 
-bool rmt_ir_send_one(uint8_t pin, rmt_ir_vendor_t brand, uint32_t code, uint8_t bits, uint8_t burst, uint8_t repeat) {
+bool rmt_ir_send_one(uint8_t pin, rmt_ir_vendor_t brand, uint32_t code, size_t bits, size_t burst, size_t repeat) {
 
 	irTX = 1;
 	for(;;){
@@ -293,7 +297,7 @@ void rmt_ir_send_del(rmt_ir_send_handle_t handle) {
     free(dev);
 }
 
-bool rmt_ir_send(rmt_ir_send_handle_t handle, uint32_t code, uint8_t bits, uint8_t burst, uint8_t repeat) {
+bool rmt_ir_send(rmt_ir_send_handle_t handle, uint32_t code, size_t bits, size_t burst, size_t repeat) {
     rmt_ir_send_dev_t* dev = (rmt_ir_send_dev_t*)handle;
     if(ESP_OK!=rmt_enable(dev->tx_handle)) {
         return false;
@@ -422,10 +426,31 @@ static uint32_t rc5_check(const rmt_symbol_word_t *item, size_t *len){
 }
 
 static bool irrx_done(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata, void *udata){
-	BaseType_t h = pdFALSE;
-	QueueHandle_t q = (QueueHandle_t)udata;
-	xQueueSendFromISR(q, edata, &h);
-	return h == pdTRUE;
+	rmt_ir_recv_dev_t* dev = (rmt_ir_recv_dev_t*)udata;
+    size_t len = edata->num_symbols;
+    rmt_symbol_word_t *rx_items =edata->received_symbols;
+    if(len > 11){
+        uint32_t rcode = 0; rmt_ir_vendor_t rproto = IR_UNK;
+        if( rcode = nec_check(rx_items, &len) ){
+            rproto = IR_NEC;
+        }else if( rcode = sony_check(rx_items, &len) ){
+            rproto = IR_SONY;
+        }else if( rcode = sam_check(rx_items, &len) ){
+            rproto = IR_SAM;
+        }else if( rcode = rc5_check(rx_items, &len) ){
+            rproto = IR_RC5;
+        }
+        dev->code_waiting = true;
+        dev->last_code = rcode;
+        dev->last_vendor_id = rproto;
+        dev->last_size = len;
+    }
+    if(dev->callback!=NULL) {
+        BaseType_t h = pdFALSE;
+        QueueHandle_t q = dev->rx_queue;
+        xQueueSendFromISR(q, edata, &h);
+        return h == pdTRUE;
+    }
 }
 
 static void recv_task(void* param) {
@@ -438,34 +463,34 @@ static void recv_task(void* param) {
         .signal_range_min_ns = 1250,
         .signal_range_max_ns = 12000000,
     };
-    rmt_enable(dev->rx_handle);
+    
     rmt_receive(dev->rx_handle, symbols, sizeof(symbols), &rx_config);
     for(;;){
         if (xQueueReceive(dev->rx_queue, &rx_data, pdMS_TO_TICKS(1000)) == pdPASS){
-            size_t len = rx_data.num_symbols;
-            rmt_symbol_word_t *rx_items = rx_data.received_symbols;
-
-            if(len > 11){
-                uint32_t rcode = 0; rmt_ir_vendor_t rproto = IR_UNK;
-                if( rcode = nec_check(rx_items, &len) ){
-                    rproto = IR_NEC;
-                }else if( rcode = sony_check(rx_items, &len) ){
-                    rproto = IR_SONY;
-                }else if( rcode = sam_check(rx_items, &len) ){
-                    rproto = IR_SAM;
-                }else if( rcode = rc5_check(rx_items, &len) ){
-                    rproto = IR_RC5;
-                }
-                if(dev->callback!=NULL) {
-                    dev->callback(rproto,rcode,dev->callback_state);
-                }
-            } 
+            if(dev->callback!=NULL) {
+                dev->callback(dev->last_vendor_id,dev->last_code,dev->last_size, dev->callback_state);
+            }    
             rmt_receive(dev->rx_handle, symbols, sizeof(symbols), &rx_config);
         }
     }
-
 }
-
+bool rmt_ir_recv_poll(rmt_ir_recv_handle_t handle, rmt_ir_vendor_t* out_brand, uint32_t* out_code, size_t* out_size_bits) {
+    rmt_ir_recv_dev_t* dev = (rmt_ir_recv_dev_t*)handle;
+    if(dev->code_waiting) {
+        dev->code_waiting = false;
+        if(out_brand) {
+            *out_brand = dev->last_vendor_id;
+        }
+        if(out_code) {
+            *out_code = dev->last_code;
+        }
+        if(out_size_bits) {
+            *out_size_bits = dev->last_size;
+        }
+        return true;
+    }
+    return false;
+}
 bool rmt_ir_recv_create(uint8_t pin, rmt_ir_on_recv_callback_t callback, void* callback_state, rmt_ir_recv_handle_t* out_handle) {
     *out_handle = NULL;
     rmt_ir_recv_dev_t* dev = (rmt_ir_recv_dev_t*)malloc(sizeof(rmt_ir_recv_dev_t));
@@ -473,8 +498,7 @@ bool rmt_ir_recv_create(uint8_t pin, rmt_ir_on_recv_callback_t callback, void* c
         return false;
     }
     rmt_rx_done_event_data_t rx_data; 
-    QueueHandle_t rx_queue = xQueueCreate(1, sizeof(rx_data));
-
+    
     rmt_channel_handle_t rx_channel = NULL;
     
     rmt_rx_channel_config_t rx_ch_conf = {
@@ -486,33 +510,46 @@ bool rmt_ir_recv_create(uint8_t pin, rmt_ir_on_recv_callback_t callback, void* c
     
     if(ESP_OK!=rmt_new_rx_channel(&rx_ch_conf, &rx_channel)) {
         free(dev);
-        vQueueDelete(rx_queue);
         return false;
     }
     rmt_rx_event_callbacks_t cbs = {
         .on_recv_done = irrx_done,
     };
 
-    if(ESP_OK!=rmt_rx_register_event_callbacks(rx_channel, &cbs, rx_queue)) {
+    if(ESP_OK!=rmt_rx_register_event_callbacks(rx_channel, &cbs, dev)) {
         free(dev);
-        vQueueDelete(rx_queue);
         rmt_del_channel(rx_channel);
         return false;
     }
-    dev->rx_queue = rx_queue;
     dev->rx_handle = rx_channel;
+    dev->last_code = 0;
+    dev->last_vendor_id = 0;
+    dev->code_waiting = 0;
+    dev->last_size = 0;
     dev->callback = callback;
     dev->callback_state = callback_state;
-    TaskHandle_t task = NULL;
-    xTaskCreate(recv_task,"rmt_ir_recv_task",2048,dev,10,&task);
-    if(task==NULL) {
-        free(dev);
-        vQueueDelete(rx_queue);
-        rmt_del_channel(rx_channel);
-        return false;
+    dev->rx_task = NULL;
+    dev->rx_queue = NULL;
+    if(callback!=NULL) {
+        QueueHandle_t rx_queue = xQueueCreate(1, sizeof(rx_data));
+        if(rx_queue==NULL) {
+            free(dev);
+            rmt_del_channel(rx_channel);
+            return false;
+        }
+        TaskHandle_t task = NULL;
+        dev->rx_queue = rx_queue;
+        xTaskCreate(recv_task,"rmt_ir_recv_task",2048,dev,10,&task);
+        if(task==NULL) {
+            free(dev);
+            vQueueDelete(rx_queue);
+            rmt_del_channel(rx_channel);
+            return false;
+        }
+        dev->rx_task = task;
+        *out_handle = dev;
     }
-    dev->rx_task = task;
-    *out_handle = dev;
+    rmt_enable(dev->rx_handle);
     return true;
 }
 void rmt_ir_recv_del(rmt_ir_recv_handle_t handle) {
@@ -521,9 +558,13 @@ void rmt_ir_recv_del(rmt_ir_recv_handle_t handle) {
     }
     rmt_ir_recv_dev_t* dev = (rmt_ir_recv_dev_t*)handle;
     dev->callback = NULL;
-    vTaskDelete(dev->rx_task);
+    if(dev->rx_task!=NULL) {
+        vTaskDelete(dev->rx_task);
+    }
     rmt_disable(dev->rx_handle);
-    vQueueDelete(dev->rx_queue);
+    if(dev->rx_queue!=NULL) {
+        vQueueDelete(dev->rx_queue);
+    }
     rmt_del_channel(dev->rx_handle);
     free(dev);
 

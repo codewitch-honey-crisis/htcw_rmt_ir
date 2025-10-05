@@ -1,6 +1,6 @@
 {
     "name": "htcw_rmt_ir",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Provides support for common IR based remote control features on the ESP32",
     "keywords": ["remove","TV","IR","rmt","ESP32"],
     "authors": {

@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include "htcw_rmt_ir.h"
 #ifdef RECV
-void on_recv(rmt_ir_vendor_t brand, uint32_t code, void* state) {
+void on_recv(rmt_ir_vendor_t brand, uint32_t code, size_t size_bits, void* state) {
     switch(brand) {
         case IR_SAM: fputs("Samsung",stdout); break;
         case IR_SONY: fputs("Sony",stdout); break;
