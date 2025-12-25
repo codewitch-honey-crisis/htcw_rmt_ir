@@ -3,6 +3,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 /// @brief The vendor of the signal
 typedef enum { 
     /// @brief Unknown vendor
@@ -24,9 +27,7 @@ typedef void* rmt_ir_recv_handle_t;
 
 /// @brief A callback to receive messages
 typedef void(*rmt_ir_on_recv_callback_t)(rmt_ir_vendor_t brand, uint32_t code, size_t size_bits, void* state);
-#ifdef __cplusplus
-extern "C" {
-#endif
+
 /// @brief Creates a handle with which to send IR remote signals
 /// @param pin The pin to use
 /// @param brand The vendor
